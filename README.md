@@ -154,3 +154,6 @@ WORKER_FLAG=permctf{RC3_t3N53rFL0w_L4mBd4_3dede3dd}
 ```
 permctf{RC3_t3N53rFL0w_L4mBd4_3dede3dd}
 ```
+
+## 7. Exploit
+Файл с эксплоитом: [exploit.py](/exploit.py)
